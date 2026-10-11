@@ -8,7 +8,7 @@
 import Foundation
 import IDevice
 
-struct IDeviceSwiftError: Error {
+struct IDeviceSwiftError: Error, CustomStringConvertible {
 	private let _message: String
 	private let _code: Int32
 	
@@ -34,5 +34,9 @@ struct IDeviceSwiftError: Error {
 	) {
 		self._message = message
 		self._code = code
+	}
+
+	var description: String {
+		_message.isEmpty ? "Error \(_code)" : _message
 	}
 }
