@@ -96,26 +96,23 @@ public class InstallationProxy: Identifiable, ObservableObject {
 				throw IDeviceSwiftError(message: "Missing File Handle")
 			}
 			
-			let data = try Data(contentsOf: url)
-			let totalSize = data.count
+			// streamed in chunks, loading a multi-GB package whole gets the app killed for memory
+			let input = try FileHandle(forReadingFrom: url)
+			defer { try? input.close() }
+
+			let totalSize = try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int ?? 0
 			let chunkSize = 64 * 1024 * 1024 // 67mb
 			var totalBytesWritten = 0
-			
-			guard let rawBuffer = data.withUnsafeBytes({ $0.baseAddress })?.assumingMemoryBound(to: UInt8.self) else {
-				throw IDeviceSwiftError(message: "Error writing to AFC")
-			}
-			
-			while totalBytesWritten < totalSize {
-				let bytesLeft = totalSize - totalBytesWritten
-				let bytesToWrite = min(chunkSize, bytesLeft)
-				let writePtr = rawBuffer.advanced(by: totalBytesWritten)
-				
-				let result = afc_file_write(fileHandle, writePtr, bytesToWrite)
+
+			while let chunk = try input.read(upToCount: chunkSize), !chunk.isEmpty {
+				let result = chunk.withUnsafeBytes {
+					afc_file_write(fileHandle, $0.baseAddress!.assumingMemoryBound(to: UInt8.self), chunk.count)
+				}
 				if result != nil {
 					throw IDeviceSwiftError(result)
 				}
-				
-				totalBytesWritten += bytesToWrite
+
+				totalBytesWritten += chunk.count
 				
 				let progress = Double(totalBytesWritten) / Double(totalSize)
 				try await self._updateUploadProgress(with: progress)
