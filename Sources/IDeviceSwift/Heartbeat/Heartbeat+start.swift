@@ -145,14 +145,10 @@ extension HeartbeatManager {
 	// MARK: - RSD Tunnel
 
 	internal func ensureRSDTunnel() throws {
-		restartLock.lock()
-		defer { restartLock.unlock() }
-
 		guard let pairingFile = getPairingRsd() else {
 			Logger.heartbeat.error("RSD pairing file not found")
 			throw IDeviceSwiftError(message: "Missing Pairing")
 		}
-		defer { rp_pairing_file_free(pairingFile) }
 
 		var addr = sockaddr_in()
 		memset(&addr, 0, MemoryLayout.size(ofValue: addr))
@@ -160,43 +156,68 @@ extension HeartbeatManager {
 		addr.sin_port = CFSwapInt16HostToBig(port_rsd)
 
 		guard inet_pton(AF_INET, ipAddress, &addr.sin_addr) == 1 else {
+			rp_pairing_file_free(pairingFile)
 			Logger.heartbeat.error("Invalid IP address")
 			throw IDeviceSwiftError(message: "Invalid IP address")
 		}
 
-		var newAdapter: AdapterHandle?
-		var newHandshake: RsdHandshakeHandle?
+		var failure: IDeviceSwiftError?
+		let done = DispatchSemaphore(value: 0)
 
-		let result = withUnsafePointer(to: &addr) {
-			$0.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { ptr in
-				tunnel_create_rppairing(
-					ptr,
-					socklen_t(MemoryLayout<sockaddr_in>.size),
-					"IdeviceKit",
-					pairingFile,
-					nil,
-					nil,
-					&newAdapter,
-					&newHandshake
-				)
+		// only the connect has a timeout in idevice, a handshake nobody answers blocks forever,
+		// so it runs on its own thread and gets abandoned instead of holding every later install
+		Thread { [self] in
+			defer {
+				rp_pairing_file_free(pairingFile)
+				done.signal()
 			}
-		}
-				
-		if let err = result {
-			let error = IDeviceSwiftError(err)
-			Logger.heartbeat.error("RSD tunnel failed: \(error.description, privacy: .public)")
-			throw error
+
+			var newAdapter: AdapterHandle?
+			var newHandshake: RsdHandshakeHandle?
+
+			let result = withUnsafePointer(to: &addr) {
+				$0.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { ptr in
+					tunnel_create_rppairing(
+						ptr,
+						socklen_t(MemoryLayout<sockaddr_in>.size),
+						"IdeviceKit",
+						pairingFile,
+						nil,
+						nil,
+						&newAdapter,
+						&newHandshake
+					)
+				}
+			}
+
+			if let err = result {
+				failure = IDeviceSwiftError(err)
+				return
+			}
+
+			restartLock.lock()
+			defer { restartLock.unlock() }
+
+			if let oldHandshake = handshake {
+				rsd_handshake_free(oldHandshake)
+			}
+			if let oldAdapter = adapter {
+				adapter_free(oldAdapter)
+			}
+
+			adapter = newAdapter
+			handshake = newHandshake
+		}.start()
+
+		guard done.wait(timeout: .now() + 10) == .success else {
+			Logger.heartbeat.error("RSD tunnel timed out")
+			throw IDeviceSwiftError(message: "Tunnel timed out, check Wi-Fi and the VPN")
 		}
 
-		if let oldHandshake = handshake {
-			rsd_handshake_free(oldHandshake)
+		if let failure {
+			Logger.heartbeat.error("RSD tunnel failed: \(failure.description, privacy: .public)")
+			throw failure
 		}
-		if let oldAdapter = adapter {
-			adapter_free(oldAdapter)
-		}
-
-		adapter = newAdapter
-		handshake = newHandshake
 	}
 
 	// MARK: - Start Heartbeat
